@@ -293,6 +293,5 @@ func (hns hnsV2) deleteLoadBalancer(hnsID string) error {
 		return nil
 	}
 
-	err = lb.Delete()
-	return err
+	return lb.Delete()
 }

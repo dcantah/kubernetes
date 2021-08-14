@@ -38,7 +38,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	apiutil "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/events"
@@ -138,15 +137,12 @@ type remoteSubnetInfo struct {
 
 const NETWORK_TYPE_OVERLAY = "overlay"
 
-func newHostNetworkService() (HostNetworkService, hcn.SupportedFeatures) {
-	var hns HostNetworkService
-	hns = hnsV1{}
-	supportedFeatures := hcn.GetSupportedFeatures()
-	if supportedFeatures.Api.V2 {
+func newHostNetworkService() HostNetworkService {
+	var hns HostNetworkService = hnsV1{}
+	if err := hcn.V2ApiSupported(); err == nil {
 		hns = hnsV2{}
 	}
-
-	return hns, supportedFeatures
+	return hns
 }
 
 func getNetworkName(hnsNetworkName string) (string, error) {
@@ -187,24 +183,19 @@ func (t DualStackCompatTester) DualStackCompatible(networkName string) bool {
 		return false
 	}
 
-	globals, err := hcn.GetGlobals()
-	if err != nil {
-		klog.ErrorS(err, "Unable to determine networking stack version. Falling back to single-stack")
-		return false
-	}
-
-	if !kernelSupportsDualstack(globals.Version) {
-		klog.InfoS("This version of Windows does not support dual-stack. Falling back to single-stack")
+	if err := hcn.DSRSupported(); err != nil {
+		klog.Infof("%s. Falling back to single stack", err.Error())
 		return false
 	}
 
 	// check if network is using overlay
-	hns, _ := newHostNetworkService()
-	networkName, err = getNetworkName(networkName)
+	hns := newHostNetworkService()
+	networkName, err := getNetworkName(networkName)
 	if err != nil {
 		klog.ErrorS(err, "unable to determine dual-stack status %v. Falling back to single-stack")
 		return false
 	}
+
 	networkInfo, err := getNetworkInfo(hns, networkName)
 	if err != nil {
 		klog.ErrorS(err, "unable to determine dual-stack status %v. Falling back to single-stack")
@@ -218,19 +209,6 @@ func (t DualStackCompatTester) DualStackCompatible(networkName string) bool {
 	}
 
 	return true
-}
-
-// The hcsshim version logic has a bug that did not calculate the versioning of DualStack correctly.
-// DualStack is supported in WS 2004+ (10.0.19041+) where HCN component version is 11.10+
-// https://github.com/microsoft/hcsshim/pull/1003#issuecomment-827930358
-func kernelSupportsDualstack(currentVersion hcn.Version) bool {
-	hnsVersion := fmt.Sprintf("%d.%d.0", currentVersion.Major, currentVersion.Minor)
-	v, err := version.ParseSemantic(hnsVersion)
-	if err != nil {
-		return false
-	}
-
-	return v.AtLeast(version.MustParseSemantic("11.10.0"))
 }
 
 func Log(v interface{}, message string, level klog.Level) {
@@ -395,9 +373,7 @@ func (proxier *Proxier) serviceMapChange(previous, current proxy.ServiceMap) {
 }
 
 func (proxier *Proxier) onServiceMapChange(svcPortName *proxy.ServicePortName) {
-
 	svc, exists := proxier.serviceMap[*svcPortName]
-
 	if exists {
 		svcInfo, ok := svc.(*serviceInfo)
 
@@ -413,14 +389,12 @@ func (proxier *Proxier) onServiceMapChange(svcPortName *proxy.ServicePortName) {
 
 // returns a new proxy.Endpoint which abstracts a endpointsInfo
 func (proxier *Proxier) newEndpointInfo(baseInfo *proxy.BaseEndpointInfo) proxy.Endpoint {
-
 	portNumber, err := baseInfo.Port()
-
 	if err != nil {
 		portNumber = 0
 	}
 
-	info := &endpointsInfo{
+	return &endpointsInfo{
 		ip:         baseInfo.IP(),
 		port:       uint16(portNumber),
 		isLocal:    baseInfo.GetIsLocal(),
@@ -433,8 +407,6 @@ func (proxier *Proxier) newEndpointInfo(baseInfo *proxy.BaseEndpointInfo) proxy.
 		serving:     baseInfo.Serving,
 		terminating: baseInfo.Terminating,
 	}
-
-	return info
 }
 
 func newSourceVIP(hns HostNetworkService, network string, ip string, mac string, providerAddress string) (*endpointsInfo, error) {
@@ -448,8 +420,7 @@ func newSourceVIP(hns HostNetworkService, network string, ip string, mac string,
 		serving:     true,
 		terminating: false,
 	}
-	ep, err := hns.createEndpoint(hnsEndpoint, network)
-	return ep, err
+	return hns.createEndpoint(hnsEndpoint, network)
 }
 
 func (ep *endpointsInfo) Cleanup() {
@@ -488,8 +459,8 @@ func (proxier *Proxier) newServiceInfo(port *v1.ServicePort, service *v1.Service
 	info := &serviceInfo{BaseServiceInfo: baseInfo}
 	preserveDIP := service.Annotations["preserve-destination"] == "true"
 	localTrafficDSR := service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal
-	err := hcn.DSRSupported()
-	if err != nil {
+
+	if err := hcn.DSRSupported(); err != nil {
 		preserveDIP = false
 		localTrafficDSR = false
 	}
@@ -577,12 +548,11 @@ type Proxier struct {
 	// precomputing some number of those and cache for future reuse.
 	precomputedProbabilities []string
 
-	hns               HostNetworkService
-	network           hnsNetworkInfo
-	sourceVip         string
-	hostMac           string
-	isDSR             bool
-	supportedFeatures hcn.SupportedFeatures
+	hns       HostNetworkService
+	network   hnsNetworkInfo
+	sourceVip string
+	hostMac   string
+	isDSR     bool
 }
 
 type localPort struct {
@@ -642,7 +612,7 @@ func NewProxier(
 	}
 
 	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder)
-	hns, supportedFeatures := newHostNetworkService()
+	hns := newHostNetworkService()
 	hnsNetworkName, err := getNetworkName(config.NetworkName)
 	if err != nil {
 		return nil, err
@@ -713,7 +683,7 @@ func NewProxier(
 			}
 		}
 		if len(hostMac) == 0 {
-			return nil, fmt.Errorf("Could not find host mac address for %s", nodeIP)
+			return nil, fmt.Errorf("could not find host mac address for %s", nodeIP)
 		}
 	}
 
@@ -735,7 +705,6 @@ func NewProxier(
 		sourceVip:           sourceVip,
 		hostMac:             hostMac,
 		isDSR:               isDSR,
-		supportedFeatures:   supportedFeatures,
 		isIPv6Mode:          isIPv6,
 	}
 
@@ -1262,8 +1231,9 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 
 		sessionAffinityClientIP := svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP
-		if sessionAffinityClientIP && !proxier.supportedFeatures.SessionAffinity {
-			klog.InfoS("Session Affinity is not supported on this version of Windows.")
+		err = hcn.SessionAffinitySupported()
+		if sessionAffinityClientIP && err != nil {
+			klog.InfoS(err.Error())
 		}
 
 		hnsLoadBalancer, err := hns.getLoadBalancer(
